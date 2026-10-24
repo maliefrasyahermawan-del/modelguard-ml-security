@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ModelGuard — Report #{{ scan.id }}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="inner">
+    <div>
+      <div class="logo">Model<span>Guard</span></div>
+      <div class="tagline">ML Model Security Scanner</div>
+    </div>
+    <a href="/" class="btn btn-outline" style="margin-left:auto">&#8592; Scan Another File</a>
+  </div>
+</header>
+
+<main>
+<div class="container">
+
+  <!-- Report header card -->
+  <div class="card">
+    <div class="report-header">
+      <div>
+        <div style="font-size:1.1rem;font-weight:700;font-family:monospace;word-break:break-all">
+          {{ scan.file_name }}
+        </div>
+        <div class="meta-grid" style="margin-top:14px">
+          <div class="meta-item">
+            <label>Verdict</label>
+            <span>
+              <span class="verdict-badge verdict-{{ scan.verdict }}">
+                {% if scan.verdict == 'MALICIOUS' %}&#9940;{% elif scan.verdict == 'SUSPICIOUS' %}&#9888;{% else %}&#10003;{% endif %}
+                {{ scan.verdict }}
+              </span>
+            </span>
+          </div>
+          <div class="meta-item">
+            <label>Risk Score</label>
+            <span style="font-size:1.5rem;font-weight:700;color:{% if scan.risk_score >= 60 %}var(--danger){% elif scan.risk_score >= 30 %}var(--warn){% else %}var(--safe){% endif %}">
+              {{ scan.risk_score }}<span style="font-size:.9rem;color:var(--muted)">/100</span>
+            </span>
+          </div>
+          <div class="meta-item">
+            <label>File Size</label>
+            <span>{{ "%.2f"|format(scan.file_size / 1024) }} KB</span>
+          </div>
+          <div class="meta-item">
+            <label>Scan Duration</label>
+            <span>{{ scan.scan_duration_ms }} ms</span>
+          </div>
+          <div class="meta-item" style="grid-column: 1 / -1">
+            <label>SHA-256</label>
+            <span style="font-family:monospace;font-size:.8rem;color:var(--muted)">{{ scan.sha256 }}</span>
+          </div>
+          <div class="meta-item">
+            <label>Scanned At</label>
+            <span>{{ scan.scanned_at[:19].replace('T',' ') }} UTC</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Findings summary -->
+  {% set counts = {'CRITICAL':0,'HIGH':0,'MEDIUM':0,'LOW':0,'INFO':0} %}
+  {% for f in scan.findings %}{% if f.severity in counts %}{% set _ = counts.update({f.severity: counts[f.severity]+1}) %}{% endif %}{% endfor %}
+
+  <div class="card">
+    <div class="card-title">&#128202; Findings Summary</div>
+    <div class="summary-boxes">
+      <div class="summary-box" style="border-color:rgba(220,38,38,.3)">
+        <div class="count" style="color:#f87171">{{ counts['CRITICAL'] }}</div>
+        <div class="label">Critical</div>
+      </div>
+      <div class="summary-box" style="border-color:rgba(249,115,22,.3)">
+        <div class="count" style="color:#fb923c">{{ counts['HIGH'] }}</div>
+        <div class="label">High</div>
+      </div>
+      <div class="summary-box" style="border-color:rgba(234,179,8,.3)">
+        <div class="count" style="color:#facc15">{{ counts['MEDIUM'] }}</div>
+        <div class="label">Medium</div>
+      </div>
+      <div class="summary-box" style="border-color:rgba(59,130,246,.3)">
+        <div class="count" style="color:#60a5fa">{{ counts['LOW'] }}</div>
+        <div class="label">Low</div>
+      </div>
+      <div class="summary-box">
+        <div class="count" style="color:#9ca3af">{{ counts['INFO'] }}</div>
+        <div class="label">Info</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Layer timeline -->
+  <div class="card">
+    <div class="card-title">&#128200; Scan Layers</div>
+    {% set layer_labels = [
+      ('format', 'Layer 1', 'Format Validator'),
+      ('pickle', 'Layer 2', 'Pickle Analyzer'),
+      ('yara',   'Layer 3', 'YARA Scanner'),
+      ('deep',   'Layer 4', 'Deep Content'),
+    ] %}
+    {% set ns = namespace() %}
+    <div class="layer-timeline">
+    {% for layer_key, layer_num, layer_name in layer_labels %}
+      {% set ns.has_issues = [] %}
+      {% for f in scan.findings %}
+        {% if f.layer == layer_key and f.severity in ['CRITICAL','HIGH','MEDIUM'] %}
+          {% set _ = ns.has_issues.append(1) %}
+        {% endif %}
+      {% endfor %}
+      <div class="layer-step {% if ns.has_issues %}has-issues{% endif %}">
+        <div class="step-num">{{ layer_num }}</div>
+        <div class="step-name">{{ layer_name }}</div>
+        <div class="step-icon">
+          {% if ns.has_issues %}
+            <span style="color:var(--danger)">&#10008;</span>
+          {% elif layer_key in scan.layers_completed %}
+            <span style="color:var(--safe)">&#10003;</span>
+          {% else %}
+            <span style="color:var(--muted)">&#8212;</span>
+          {% endif %}
+        </div>
+        {% set layer_count = [] %}
+        {% for f in scan.findings %}{% if f.layer == layer_key %}{% set _ = layer_count.append(1) %}{% endif %}{% endfor %}
+        {% if layer_count %}
+          <div style="font-size:.72rem;color:var(--muted);margin-top:4px">{{ layer_count|length }} finding{{ 's' if layer_count|length != 1 }}</div>
+        {% endif %}
+      </div>
+    {% endfor %}
+    </div>
+  </div>
+
+  <!-- Findings detail -->
+  <div class="card">
+    <div class="card-title">&#128270; Findings Detail</div>
+    {% if scan.findings %}
+    <table>
+      <thead>
+        <tr>
+          <th style="width:90px">Severity</th>
+          <th style="width:80px">Layer</th>
+          <th>Title</th>
+          <th>Description</th>
+          <th>Evidence</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for f in scan.findings|sort(attribute='severity',reverse=False) %}
+        <tr>
+          <td><span class="sev sev-{{ f.severity }}">{{ f.severity }}</span></td>
+          <td><span style="font-size:.8rem;color:var(--muted);font-family:monospace">{{ f.layer }}</span></td>
+          <td style="font-weight:600;font-size:.9rem">{{ f.title }}</td>
+          <td style="font-size:.88rem;color:var(--muted)">{{ f.description }}</td>
+          <td>{% if f.evidence %}<span class="evidence">{{ f.evidence[:200] }}</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">&#10003; No findings — file appears clean.</div>
+    {% endif %}
+  </div>
+
+  <!-- Actions -->
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <a href="/report/{{ scan.id }}/json" target="_blank" class="btn btn-outline">&#128196; Download JSON Report</a>
+    <a href="/" class="btn btn-primary">&#128190; Scan Another File</a>
+  </div>
+
+</div>
+</main>
+</body>
+</html>

@@ -1,0 +1,14 @@
+.claude/
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+modelguard/uploads/
+modelguard/*.db
+modelguard/*.sqlite
+modelguard/test_models/*.pkl
+modelguard/test_models/*.joblib

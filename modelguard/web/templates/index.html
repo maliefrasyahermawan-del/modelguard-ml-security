@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ModelGuard — ML Model Security Scanner</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="inner">
+    <div>
+      <div class="logo">Model<span>Guard</span></div>
+      <div class="tagline">ML Model Security Scanner — detects malicious pickle payloads & hidden threats</div>
+    </div>
+  </div>
+</header>
+
+<main>
+<div class="container">
+
+  <!-- Upload card -->
+  <div class="card">
+    <div class="card-title">&#128274; Scan a Model File</div>
+    <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+      <div class="icon">&#128190;</div>
+      <p><strong>Drag &amp; drop</strong> a model file here, or <strong>click to browse</strong></p>
+      <p>Supported formats:</p>
+      <div class="exts">
+        <span class="ext-badge">.pkl</span>
+        <span class="ext-badge">.pt</span>
+        <span class="ext-badge">.h5</span>
+        <span class="ext-badge">.safetensors</span>
+        <span class="ext-badge">.joblib</span>
+        <span class="ext-badge">.npy</span>
+      </div>
+    </div>
+    <input type="file" id="file-input"
+           accept=".pkl,.pt,.h5,.safetensors,.joblib,.npy">
+
+    <div id="progress-wrap">
+      <div id="progress-label">Scanning…</div>
+      <div id="progress-bar-track">
+        <div id="progress-bar"></div>
+      </div>
+    </div>
+    <div id="scan-error"></div>
+  </div>
+
+  <!-- History card -->
+  <div class="card">
+    <div class="card-title">&#128203; Recent Scans</div>
+    {% if scans %}
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Filename</th>
+          <th>Verdict</th>
+          <th>Risk Score</th>
+          <th>Scanned</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for s in scans %}
+        <tr>
+          <td style="color:var(--muted);font-size:.85rem">{{ s.id }}</td>
+          <td>
+            <span style="font-family:monospace;font-size:.88rem">{{ s.file_name }}</span><br>
+            <span style="color:var(--muted);font-size:.78rem">{{ "%.1f"|format(s.file_size/1024) }} KB</span>
+          </td>
+          <td>
+            <span class="verdict-badge verdict-{{ s.verdict }}">
+              {% if s.verdict == 'MALICIOUS' %}&#9940;{% elif s.verdict == 'SUSPICIOUS' %}&#9888;{% else %}&#10003;{% endif %}
+              {{ s.verdict }}
+            </span>
+          </td>
+          <td>
+            <div class="score-bar">
+              <span style="font-weight:700;min-width:32px">{{ s.risk_score }}</span>
+              <div class="score-track">
+                <div class="score-fill"
+                     style="width:{{ s.risk_score }}%;background:{% if s.risk_score >= 60 %}var(--danger){% elif s.risk_score >= 30 %}var(--warn){% else %}var(--safe){% endif %}">
+                </div>
+              </div>
+            </div>
+          </td>
+          <td style="color:var(--muted);font-size:.85rem">{{ s.scanned_at[:16].replace('T',' ') }}</td>
+          <td><a href="/report/{{ s.id }}" class="btn btn-outline" style="font-size:.82rem;padding:5px 14px">View Report</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No scans yet. Upload a model file to get started.</div>
+    {% endif %}
+  </div>
+
+</div>
+</main>
+
+<script>
+const dropZone   = document.getElementById('drop-zone');
+const fileInput  = document.getElementById('file-input');
+const progressW  = document.getElementById('progress-wrap');
+const progressB  = document.getElementById('progress-bar');
+const progressL  = document.getElementById('progress-label');
+const errDiv     = document.getElementById('scan-error');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (f) uploadFile(f);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) uploadFile(fileInput.files[0]);
+});
+
+async function uploadFile(file) {
+  errDiv.style.display = 'none';
+  progressW.style.display = 'block';
+  progressL.textContent = `Scanning ${file.name}…`;
+
+  // Animate progress bar (indeterminate feel)
+  let pct = 0;
+  const interval = setInterval(() => {
+    pct = Math.min(pct + Math.random() * 8, 85);
+    progressB.style.width = pct + '%';
+  }, 200);
+
+  const fd = new FormData();
+  fd.append('file', file);
+
+  try {
+    const resp = await fetch('/scan', { method: 'POST', body: fd });
+    clearInterval(interval);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || resp.statusText);
+    }
+    const data = await resp.json();
+    progressB.style.width = '100%';
+    setTimeout(() => {
+      window.location.href = `/report/${data.scan_id}`;
+    }, 300);
+  } catch (err) {
+    clearInterval(interval);
+    progressW.style.display = 'none';
+    errDiv.style.display = 'block';
+    errDiv.textContent = 'Scan failed: ' + err.message;
+    fileInput.value = '';
+  }
+}
+</script>
+</body>
+</html>
